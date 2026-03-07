@@ -1,0 +1,6 @@
+[project]
+name = "dbproject"
+version = "0.1.0"
+description = "API functions"
+requires-python = ">=3.12"
+dependencies = []
