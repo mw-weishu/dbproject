@@ -24,6 +24,8 @@ Commands:
   shortest-path <node1_id> <node2_id>
   distant-synonyms <node_id> <distance>
   distant-antonyms <node_id> <distance>
+
+  delete <node_id>
 """
 
 import argparse
@@ -105,7 +107,7 @@ def print_nodes(rows):
         print("(no results)")
         return
     for r in rows:
-        print(f"  {r.get(ID_FIELD, r.get('_id', '?'))}  [{r.get(LABEL_FIELD, '')}]")
+        print(f"{r.get(LABEL_FIELD, '')} {r.get(ID_FIELD, r.get('_id', '?'))}")
 
 
 def print_count(n: int):
@@ -197,25 +199,23 @@ def count_no_predecessors(db):
     print_count(list(db.aql.execute(aql))[0])
 
 
-def most_neighbors(db):
-    # Stream out-degrees and in-degrees separately; combine in Python
-    # to avoid materializing the full degree array server-side (OOM)
-    deg = {}
-    aql_out = f"""
-    FOR e IN {EDGE_COLLECTION}
-        COLLECT node_id = e._from WITH COUNT INTO cnt
-        RETURN {{node_id: node_id, cnt: cnt}}
-    """
-    for row in db.aql.execute(aql_out, batch_size=10000):
-        deg[row['node_id']] = row['cnt']
+def _compute_degrees(db):
+    """Stream all edges and return a dict: node _id -> unique neighbor count (any direction)."""
+    neighbor_sets = {}
+    aql = f"FOR e IN {EDGE_COLLECTION} RETURN [e._from, e._to]"
+    for row in db.aql.execute(aql, batch_size=50000):
+        f, t = row[0], row[1]
+        if f not in neighbor_sets:
+            neighbor_sets[f] = set()
+        if t not in neighbor_sets:
+            neighbor_sets[t] = set()
+        neighbor_sets[f].add(t)
+        neighbor_sets[t].add(f)
+    return {k: len(v) for k, v in neighbor_sets.items()}
 
-    aql_in = f"""
-    FOR e IN {EDGE_COLLECTION}
-        COLLECT node_id = e._to WITH COUNT INTO cnt
-        RETURN {{node_id: node_id, cnt: cnt}}
-    """
-    for row in db.aql.execute(aql_in, batch_size=10000):
-        deg[row['node_id']] = deg.get(row['node_id'], 0) + row['cnt']
+
+def most_neighbors(db):
+    deg = _compute_degrees(db)
 
     if not deg:
         print("(no results)")
@@ -226,34 +226,31 @@ def most_neighbors(db):
         if d == max_deg:
             node = list(db.aql.execute("RETURN DOCUMENT(@h)", bind_vars={"h": node_id}))[0]
             if node:
-                print(f"  {node.get(ID_FIELD, '?')}  [{node.get(LABEL_FIELD, '')}]  neighbors: {d}")
+                print(f"{node.get(LABEL_FIELD, '')} {node.get(ID_FIELD, '?')}  neighbors: {d}")
 
 
 def count_single_neighbor(db):
-    # Stream out-degrees and in-degrees separately; combine in Python
-    deg = {}
-    aql_out = f"""
-    FOR e IN {EDGE_COLLECTION}
-        COLLECT node_id = e._from WITH COUNT INTO cnt
-        RETURN {{node_id: node_id, cnt: cnt}}
-    """
-    for row in db.aql.execute(aql_out, batch_size=10000):
-        deg[row['node_id']] = row['cnt']
-
-    aql_in = f"""
-    FOR e IN {EDGE_COLLECTION}
-        COLLECT node_id = e._to WITH COUNT INTO cnt
-        RETURN {{node_id: node_id, cnt: cnt}}
-    """
-    for row in db.aql.execute(aql_in, batch_size=10000):
-        deg[row['node_id']] = deg.get(row['node_id'], 0) + row['cnt']
-
+    deg = _compute_degrees(db)
     print_count(sum(1 for d in deg.values() if d == 1))
 
 
 def rename(db, old_node_id: str, new_node_id: str, new_label: str):
     handle = resolve_handle(db, old_node_id)
     key = handle.split("/")[1]
+
+    # Abort if another node already carries new_node_id as its id_original,
+    # which would create ambiguous duplicates and corrupt future lookups.
+    aql_check = f"""
+    FOR n IN {NODE_COLLECTION}
+        FILTER n.{ID_FIELD} == @new_id
+        FILTER n._id != @current
+        LIMIT 1
+        RETURN n._id
+    """
+    if list(db.aql.execute(aql_check, bind_vars={"new_id": new_node_id, "current": handle})):
+        print(f"Error: a node with id '{new_node_id}' already exists.", file=sys.stderr)
+        sys.exit(1)
+
     aql = f"""
     UPDATE @key WITH {{ {ID_FIELD}: @new_id, {LABEL_FIELD}: @new_label, labels: @new_label }}
     IN {NODE_COLLECTION}
@@ -270,6 +267,46 @@ def rename(db, old_node_id: str, new_node_id: str, new_label: str):
         print(f"  (internal _key '{key}' unchanged)")
     else:
         print("Rename failed.", file=sys.stderr)
+
+
+def delete_node(db, node_id: str):
+    handle = resolve_handle(db, node_id)
+    key = handle.split("/")[1]
+
+    # Count edges so the user knows what will be removed
+    aql_count = f"""
+    RETURN COUNT(
+        FOR e IN {EDGE_COLLECTION}
+            FILTER e._from == @handle OR e._to == @handle
+            RETURN 1
+    )
+    """
+    edge_count = list(db.aql.execute(aql_count, bind_vars={"handle": handle}))[0]
+
+    confirm = input(
+        f"Delete '{node_id}' and its {edge_count} edge(s)? [y/N] "
+    ).strip().lower()
+    if confirm != "y":
+        print("Aborted.")
+        return
+
+    # Remove all connected edges first, then the node
+    aql_edges = f"""
+    FOR e IN {EDGE_COLLECTION}
+        FILTER e._from == @handle OR e._to == @handle
+        REMOVE e IN {EDGE_COLLECTION}
+    """
+    db.aql.execute(aql_edges, bind_vars={"handle": handle})
+
+    aql_node = f"""
+    REMOVE @key IN {NODE_COLLECTION}
+    RETURN OLD.{ID_FIELD}
+    """
+    result = list(db.aql.execute(aql_node, bind_vars={"key": key}))
+    if result:
+        print(f"Deleted: {result[0]}  (edges removed: {edge_count})")
+    else:
+        print("Delete failed.", file=sys.stderr)
 
 
 def similar(db, node_id):
@@ -310,7 +347,7 @@ def shortest_path(db, node1_id: str, node2_id: str):
         return
     print(f"Shortest path ({len(path) - 1} hops):")
     for node in path:
-        print(f"  {node.get(ID_FIELD, '?')}  [{node.get(LABEL_FIELD, '')}]")
+        print(f"{node.get(LABEL_FIELD, '')} {node.get(ID_FIELD, '?')}")
 
 
 def distant_synonyms_antonyms(db, node_id: str, distance: int, find: str):
@@ -363,7 +400,7 @@ def distant_synonyms_antonyms(db, node_id: str, distance: int, find: str):
         cursor = db.aql.execute("RETURN DOCUMENT(@h)", bind_vars={"h": h})
         node = list(cursor)[0]
         if node:
-            print(f"  {node.get(ID_FIELD, '?')}  [{node.get(LABEL_FIELD, '')}]")
+            print(f"{node.get(LABEL_FIELD, '')} {node.get(ID_FIELD, '?')}")
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +435,7 @@ def build_parser():
     node_cmd("grandchildren")
     node_cmd("grandparents")
     node_cmd("similar")
+    node_cmd("delete")
 
     sub.add_parser("count-nodes")
     sub.add_parser("count-no-successors")
@@ -440,6 +478,7 @@ DISPATCH = {
     "most-neighbors":        lambda db, a: most_neighbors(db),
     "count-single-neighbor": lambda db, a: count_single_neighbor(db),
     "rename":                lambda db, a: rename(db, a.old_node_id, a.new_node_id, a.new_label),
+    "delete":                lambda db, a: delete_node(db, a.node_id),
     "similar":               lambda db, a: similar(db, a.node_id),
     "shortest-path":         lambda db, a: shortest_path(db, a.node1_id, a.node2_id),
     "distant-synonyms":      lambda db, a: distant_synonyms_antonyms(db, a.node_id, a.distance, "synonym"),
