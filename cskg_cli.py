@@ -30,6 +30,7 @@ Commands:
 
 import argparse
 import sys
+import time
 from urllib.parse import quote, unquote
 from arango import ArangoClient
 from arango.http import DefaultHTTPClient
@@ -48,13 +49,18 @@ LABEL_FIELD     = "label"
 # ---------------------------------------------------------------------------
 
 def connect(host: str, port: int, db: str, user: str, password: str):
-    # Strip any scheme the caller may have included to avoid double-scheme URLs
-    for scheme in ("https://", "http://"):
-        if host.startswith(scheme):
-            host = host[len(scheme):]
+    # Detect or strip an explicit scheme so we never double-up
+    scheme = "https"
+    for s in ("https://", "http://"):
+        if host.startswith(s):
+            scheme = s.rstrip(":/")
+            host = host[len(s):]
             break
+    # Local / plain-HTTP hosts: localhost or plain IPs with no TLS
+    if scheme == "https" and host in ("localhost", "127.0.0.1", "::1"):
+        scheme = "http"
     http_client = DefaultHTTPClient(request_timeout=600)  # 10-minute timeout
-    client = ArangoClient(hosts=f"https://{host}:{port}", http_client=http_client)
+    client = ArangoClient(hosts=f"{scheme}://{host}:{port}", http_client=http_client)
     return client.db(db, username=user, password=password, verify=True)
 
 
@@ -363,42 +369,68 @@ def distant_synonyms_antonyms(db, node_id: str, distance: int, find: str):
     syn_rel = "/r/Synonym"
     ant_rel = "/r/Antonym"
 
-    # {handle: (is_synonym_parity, min_distance)}
-    visited = {handle: (True, 0)}
-    frontier = [(handle, True, 0)]
+    # visited: handle -> (set_of_parities_at_min_distance, min_distance)
+    # A node is only expanded at its first (shortest) discovery distance.
+    # We collect ALL parities reachable at that minimum distance so that
+    # nodes reachable via both a synonym-path and an antonym-path of equal
+    # length are counted correctly for both queries.
+    visited = {handle: ({True}, 0)}
+    # frontier tracks (handle, parity) so parity propagates correctly
+    frontier = [(handle, True)]
 
-    while frontier:
-        next_frontier = []
-        for h, is_syn, dist in frontier:
-            if dist >= distance:
-                continue
-            aql = f"""
-            FOR v, e IN 1..1 ANY @start {EDGE_COLLECTION}
+    for dist in range(1, distance + 1):
+        if not frontier:
+            break
+
+        # Build handle -> set-of-parities map for the batch query
+        frontier_map = {}
+        for h, p in frontier:
+            frontier_map.setdefault(h, set()).add(p)
+
+        aql = f"""
+        FOR start IN @starts
+            FOR v, e IN 1..1 ANY start {EDGE_COLLECTION}
                 FILTER e.relation IN [@syn, @ant]
-                RETURN {{ v: v, relation: e.relation }}
-            """
-            for row in db.aql.execute(aql, bind_vars={"start": h, "syn": syn_rel, "ant": ant_rel}):
-                v_handle = row["v"]["_id"]
-                new_is_syn = is_syn if row["relation"] == syn_rel else not is_syn
-                new_dist = dist + 1
-                if v_handle not in visited or visited[v_handle][1] > new_dist:
-                    visited[v_handle] = (new_is_syn, new_dist)
-                    next_frontier.append((v_handle, new_is_syn, new_dist))
-        frontier = next_frontier
+                RETURN {{ start: start, vid: v._id, relation: e.relation }}
+        """
+        rows = list(db.aql.execute(aql, batch_size=10000, bind_vars={
+            "starts": list(frontier_map.keys()),
+            "syn":    syn_rel,
+            "ant":    ant_rel,
+        }))
+
+        next_frontier = {}  # (handle, parity) -> True, deduplicated
+        for row in rows:
+            v_handle = row["vid"]
+            for parent_par in frontier_map[row["start"]]:
+                new_par = parent_par if row["relation"] == syn_rel else not parent_par
+
+                if v_handle not in visited:
+                    # First discovery — record minimum distance and this parity
+                    visited[v_handle] = ({new_par}, dist)
+                    next_frontier[(v_handle, new_par)] = True
+                elif visited[v_handle][1] == dist:
+                    # Same minimum distance — add this parity if not seen yet
+                    if new_par not in visited[v_handle][0]:
+                        visited[v_handle][0].add(new_par)
+                        next_frontier[(v_handle, new_par)] = True
+                # visited[v_handle][1] < dist → already found shorter, skip
+
+        frontier = list(next_frontier.keys())
 
     want_syn = (find == "synonym")
     results = [
-        h for h, (parity, d) in visited.items()
-        if h != handle and parity == want_syn and d == distance
+        h for h, (parities, d) in visited.items()
+        if h != handle and want_syn in parities and d == distance
     ]
 
     if not results:
         print("(no results)")
         return
 
-    for h in results:
-        cursor = db.aql.execute("RETURN DOCUMENT(@h)", bind_vars={"h": h})
-        node = list(cursor)[0]
+    # Fetch all result nodes in one query
+    aql_fetch = "FOR h IN @handles RETURN DOCUMENT(h)"
+    for node in db.aql.execute(aql_fetch, bind_vars={"handles": results}):
         if node:
             print(f"{node.get(LABEL_FIELD, '')} {node.get(ID_FIELD, '?')}")
 
@@ -415,9 +447,11 @@ def build_parser():
     )
     p.add_argument("--host",     default="localhost")
     p.add_argument("--port",     type=int, default=8529)
-    p.add_argument("--db",       default="new_database")
+    p.add_argument("--db",       default="DB_Project")
     p.add_argument("--user",     default="root")
-    p.add_argument("--password", default="")
+    p.add_argument("--password", default="localpass")
+    p.add_argument("--count-time", action="store_true",
+                   help="Print query execution time after results")
 
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -486,11 +520,65 @@ DISPATCH = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Numeric command aliases
+# ---------------------------------------------------------------------------
+_ALIAS_MAP = {
+    "0":  "delete",
+    "1":  "successors",
+    "2":  "count-successors",
+    "3":  "predecessors",
+    "4":  "count-predecessors",
+    "5":  "neighbors",
+    "6":  "count-neighbors",
+    "7":  "grandchildren",
+    "8":  "grandparents",
+    "9":  "count-nodes",
+    "10": "count-no-successors",
+    "11": "count-no-predecessors",
+    "12": "most-neighbors",
+    "13": "count-single-neighbor",
+    "14": "rename",
+    "15": "similar",
+    "16": "shortest-path",
+    "17": "distant-synonyms",
+    "18": "distant-antonyms",
+}
+
+# Flags that consume the next token as their value
+_FLAGS_WITH_VALUES = {"--host", "--port", "--db", "--user", "--password"}
+
+
+def _resolve_aliases(argv):
+    """Replace a numeric command alias with the full command name."""
+    result = list(argv)
+    i = 0
+    while i < len(result):
+        tok = result[i]
+        if tok in _FLAGS_WITH_VALUES:
+            i += 2  # skip flag + value
+        elif tok.startswith("-"):
+            i += 1  # boolean flag
+        elif tok in _ALIAS_MAP:
+            result[i] = _ALIAS_MAP[tok]
+            break
+        else:
+            break  # real command name or unknown token
+    return result
+
+
 def main():
     parser = build_parser()
-    args = parser.parse_args()
+    raw = sys.argv[1:]
+    count_time = "--count-time" in raw
+    raw = [a for a in raw if a != "--count-time"]
+    args = parser.parse_args(_resolve_aliases(raw))
     db = connect(args.host, args.port, args.db, args.user, args.password)
+    t0 = time.perf_counter()
     DISPATCH[args.command](db, args)
+    if count_time:
+        elapsed = time.perf_counter() - t0
+        print(f"\nQuery time: {elapsed:.3f}s")
 
 
 if __name__ == "__main__":

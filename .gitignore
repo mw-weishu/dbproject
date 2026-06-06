@@ -1,0 +1,10 @@
+# Ignore the generated TSV file
+cskg.tsv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Node modules
+node_modules/

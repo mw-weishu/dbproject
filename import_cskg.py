@@ -47,9 +47,9 @@ except ImportError:
 # ──────────────────────────────────────────────
 DEFAULTS = dict(
     file="cskg.tsv",
-    url="https://395aefdc76cf.arangodb.cloud:8529",
+    url="https://d1b0a8055389.arangodb.cloud:8529",
     user="root",
-    password="pUvGpS1hoUMRcj2Krky3",
+    password="mkD0PXhHS1GRzAlBe6R8",
     db="DB_Project",
     node_coll="nodes",
     edge_coll="relation",
@@ -688,7 +688,7 @@ def main():
         else:
             print("  (dry run — skipped)")
 
-    print("\n[4/4] Verification …")
+    print("\n[4/5] Verification …")
     if not args.dry_run:
         n_count = nodes_coll.count()
         e_count = edges_coll.count()
@@ -697,6 +697,25 @@ def main():
     else:
         print(f"  (dry run) Would have uploaded "
               f"{len(node_map):,} nodes + {edge_count:,} edges")
+
+    # ── Phase 5: Create indexes ──
+    # Indexes are idempotent — safe to re-run on an already-indexed collection.
+    print("\n[5/5] Creating indexes …")
+    if not args.dry_run:
+        # nodes.id_original — every resolve_handle() lookup filters on this field
+        nodes_coll.add_persistent_index(
+            fields=["id_original"], unique=False, sparse=False)
+        print(f"  ✓ Persistent index on '{args.node_coll}.id_original'")
+
+        # relation.relation — BFS synonym/antonym filtering uses this field
+        edges_coll.add_persistent_index(
+            fields=["relation"], unique=False, sparse=False)
+        print(f"  ✓ Persistent index on '{args.edge_coll}.relation'")
+
+        # _from / _to on edge collections are indexed automatically by ArangoDB
+        print(f"  ✓ Edge indexes on _from / _to are managed automatically")
+    else:
+        print("  (dry run — skipped)")
 
     print("\n✓ Done.")
 
