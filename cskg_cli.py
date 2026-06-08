@@ -31,6 +31,8 @@ Commands:
 import argparse
 import sys
 import time
+import os #added line
+import json #added line
 from urllib.parse import quote, unquote
 from arango import ArangoClient
 from arango.http import DefaultHTTPClient
@@ -42,6 +44,7 @@ NODE_COLLECTION = "nodes"
 EDGE_COLLECTION = "relation"
 ID_FIELD        = "id_original"   # human-readable original node ID
 LABEL_FIELD     = "label"
+DEGREES_CACHE_FILE = ".cskg_degrees.json" #added line
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +209,17 @@ def count_no_predecessors(db):
 
 
 def _compute_degrees(db):
-    """Stream all edges and return a dict: node _id -> unique neighbor count (any direction)."""
+    """Stream edges to compute degrees, with local JSON caching."""
+    
+    if os.path.exists(DEGREES_CACHE_FILE):
+        try:
+            with open(DEGREES_CACHE_FILE, "r") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            pass 
+
+    print("Building degree cache", file=sys.stderr)
+    
     neighbor_sets = {}
     aql = f"FOR e IN {EDGE_COLLECTION} RETURN [e._from, e._to]"
     for row in db.aql.execute(aql, batch_size=50000):
@@ -217,8 +230,16 @@ def _compute_degrees(db):
             neighbor_sets[t] = set()
         neighbor_sets[f].add(t)
         neighbor_sets[t].add(f)
-    return {k: len(v) for k, v in neighbor_sets.items()}
+        
+    deg = {k: len(v) for k, v in neighbor_sets.items()}
 
+    try:
+        with open(DEGREES_CACHE_FILE, "w") as f:
+            json.dump(deg, f)
+    except IOError:
+        print("Warning: Could not save degree cache to disk.", file=sys.stderr)
+
+    return deg
 
 def most_neighbors(db):
     deg = _compute_degrees(db)
@@ -295,6 +316,9 @@ def delete_node(db, node_id: str):
     if confirm != "y":
         print("Aborted.")
         return
+    
+    if os.path.exists(DEGREES_CACHE_FILE):
+        os.remove(DEGREES_CACHE_FILE)
 
     # Remove all connected edges first, then the node
     aql_edges = f"""
