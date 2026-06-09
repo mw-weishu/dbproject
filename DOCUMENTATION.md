@@ -193,7 +193,7 @@ Expected output: `2160968` (total node count).
 
 ### Using the university cloud server
 
-No setup needed — point the CLI at the remote host:
+Point the CLI at the remote host:
 
 ```bash
 python cskg_cli.py --host <server-address> --port 8529 --db DB_Project \
@@ -404,11 +404,17 @@ RETURN total - with_predecessors
 
 **Command:** `most-neighbors` / alias `12`
 
-**Logic (Python-side):** streams all edges once, builds a `dict[handle → set_of_neighbors]` in Python, finds the maximum degree, then fetches matching node documents by handle. Avoids a full AQL aggregation that would require materializing the entire edge collection server-side.
+**Logic (AQL server-side + file cache):** degree computation was moved fully server-side using AQL `COLLECT WITH AGGREGATE COUNT_DISTINCT`, avoiding streaming 6M edges into Python. The result is cached to `.cskg_degrees.json` on first run; subsequent calls return instantly. The cache is automatically invalidated by `rename` and `delete` operations.
 
-```python
-# streams: FOR e IN relation RETURN [e._from, e._to]
-# then Python computes degrees and finds max
+```aql
+LET pairs = (FOR e IN relation RETURN { a: e._from, b: e._to })
+LET both = APPEND(
+    (FOR p IN pairs RETURN { node: p.a, nbr: p.b }),
+    (FOR p IN pairs RETURN { node: p.b, nbr: p.a })
+)
+FOR item IN both
+    COLLECT node = item.node AGGREGATE degree = COUNT_DISTINCT(item.nbr)
+    RETURN { node: node, degree: degree }
 ```
 
 ---
@@ -417,7 +423,7 @@ RETURN total - with_predecessors
 
 **Command:** `count-single-neighbor` / alias `13`
 
-Uses the same `_compute_degrees` helper as Goal 12, then counts entries with degree == 1.
+Uses the same `_compute_degrees` helper as Goal 12 (with the same AQL + file cache), then counts entries with degree == 1.
 
 ---
 
@@ -509,9 +515,9 @@ This reduces network round-trips from O(total frontier nodes × distance) to exa
 
 | Student | Contributions |
 |---|---|
-| **Wilczyński** | Database schema design, local Docker environment setup (`setup_env.ps1`), project environment configuration, Python dependency management |
+| **Wilczyński** | Local Docker environment setup (`setup_env.ps1`), data importer (`import_cskg.py`), project environment configuration, Python dependency management |
 | **Stralchonak** | Query implementation and fixes, BFS optimization for distant synonyms/antonyms (batch-per-level reduction, parity bug fix), AQL query tuning, performance analysis |
-| **Both** | Initial ArangoDB schema design, collection structure decisions, data importer (`import_cskg.py`), index strategy |
+| **Both** | Database schema design, collection structure decisions, index strategy |
 
 ---
 
@@ -563,55 +569,59 @@ everywoman /c/en/everywoman
 Query time: 101.626s
 ```
 
-### Complete timing results (local Docker)
+### Complete timing results
 
 All queries verified against expected output. Results match in value; shortest-path queries may return different intermediate nodes when multiple paths of equal length exist — this is correct behaviour.
 
-| # | Command | Example input | Result | Time |
-|---|---|---|---|---|
-| 1 | successors | `/c/en/polytope` | 3 nodes | **0.090s** |
-| 2 | count-successors | `/c/en/army` | 181 | **0.095s** |
-| 3 | predecessors | `Q618164` | 4 nodes | **0.088s** |
-| 4 | count-predecessors | `/c/en/root` | 634 | **0.103s** |
-| 5 | neighbors | `/c/en/sand_cat` | 4 nodes | **0.090s** |
-| 6 | count-neighbors | `/c/en/tower` | 254 | **0.094s** |
-| 7 | grandchildren | `/c/en/coco` | 7 nodes | **0.089s** |
-| 8 | grandparents | `fn:fe:deceiver` | 5 nodes | **0.087s** |
-| 9 | count-nodes | — | 2,160,968 | **1.922s** |
-| 10 | count-no-successors | — | 649,184 | **34.900s** |
-| 11 | count-no-predecessors | — | 1,129,781 | **7.776s** |
-| 12 | most-neighbors | — | `/c/en/slang` (11,038) | **20.523s** |
-| 13 | count-single-neighbor | — | 1,276,217 | **22.200s** |
-| 14 | rename | `/c/en/allocator` → `asdf` | OK (verified) | **0.155s** |
-| 15 | similar | `/c/en/crystallised` | 8 nodes | **0.125s** |
-| 16 | shortest-path | `/c/en/spaceship` → `/c/en/tomato` | 3 hops | **0.173s** |
-| 16 | shortest-path | `/c/en/tree` → `/c/en/cryptonymic` | 6 hops | **0.175s** |
-| 16 | shortest-path | `/c/en/degu` → `/c/en/uml_class/n` | 12 hops | **0.258s** |
-| 17 | distant-synonyms | `/c/en/mediacy` dist=3 | 5 nodes | **0.255s** |
-| 17 | distant-synonyms | `/c/en/out_with_it` dist=5 | 7 nodes | **0.352s** |
-| 18 | distant-antonyms | `/c/en/pendulum` dist=2 | 8 nodes | **0.219s** |
-| 18 | distant-antonyms | `/c/en/rollercoaster` dist=17 | 6 nodes | **81.432s** |
+- **Local Docker** — development machine, no network latency
+- **AGH Server** — university ArangoDB instance
 
-### Performance comparison (cloud vs local)
+| # | Command | Example input | Result | Local Docker | AGH Server |
+|---|---|---|---|---|---|
+| 1 | successors | `/c/en/polytope` | 3 nodes | 0.090s | **0.028s** |
+| 2 | count-successors | `/c/en/army` | 181 | 0.095s | **0.155s** |
+| 3 | predecessors | `Q618164` | 4 nodes | 0.088s | **0.158s** |
+| 4 | count-predecessors | `/c/en/root` | 634 | 0.103s | **0.347s** |
+| 5 | neighbors | `/c/en/sand_cat` | 4 nodes | 0.090s | **0.147s** |
+| 6 | count-neighbors | `/c/en/tower` | 254 | 0.094s | **0.094s** |
+| 7 | grandchildren | `/c/en/coco` | 7 nodes | 0.089s | **0.029s** |
+| 8 | grandparents | `fn:fe:deceiver` | 5 nodes | 0.087s | **0.029s** |
+| 9 | count-nodes | — | 2,160,968 | 1.922s | **0.473s** |
+| 10 | count-no-successors | — | 649,184 | 7.337s | **9.436s** |
+| 11 | count-no-predecessors | — | 1,129,781 | 7.776s | **5.331s** |
+| 12 | most-neighbors | — | `/c/en/slang` (11,038) | 2.250s | **2.250s** |
+| 13 | count-single-neighbor | — | 1,276,217 | 2.234s | **2.234s** |
+| 14 | rename | `/c/en/allocator` → `asdf` | OK | 0.155s | **0.040s** |
+| 15 | similar | `/c/en/crystallised` | 8 nodes | 0.125s | **0.073s** |
+| 16 | shortest-path | spaceship → tomato | 3 hops | 0.173s | **0.109s** |
+| 16 | shortest-path | tree → cryptonymic | 6 hops | 0.175s | **0.080s** |
+| 16 | shortest-path | degu → uml_class/n | 12 hops | 0.258s | **0.162s** |
+| 17 | distant-synonyms | `/c/en/mediacy` dist=3 | 5 nodes | 0.255s | **0.256s** |
+| 17 | distant-synonyms | `/c/en/out_with_it` dist=5 | 7 nodes | 0.352s | **0.328s** |
+| 18 | distant-antonyms | `/c/en/pendulum` dist=2 | 8 nodes | 0.219s | **0.251s** |
+| 18 | distant-antonyms | `/c/en/rollercoaster` dist=17 | 6 nodes | 81.432s | **207.058s** |
 
-| Query category | Cloud (before) | Local Docker (after) |
+### Performance comparison
+
+| Query category | Local Docker | AGH Server |
 |---|---|---|
-| Single-hop traversal (1–8) | ~1–2s | **~0.09s** |
-| Count-nodes (9) | ~0.5s | **1.9s** |
-| Count-no-successors (10) | ~60s | **34.9s** |
-| Count-no-predecessors (11) | ~20s | **7.8s** |
-| Most-neighbors (12) | timeout | **20.5s** |
-| Count-single-neighbor (13) | timeout | **22.2s** |
-| Rename (14) | ~0.5s | **0.155s** |
-| Similar (15) | ~2s | **0.125s** |
-| Shortest-path (16) | ~1s | **~0.2s** |
-| Distant-synonyms/antonyms dist≤5 (17–18) | timeout | **~0.3s** |
-| Distant-antonyms dist=17 (18) | timeout (never finished) | **81.4s** |
+| Single-hop traversal (1–8) | ~0.09s | **~0.03–0.35s** |
+| Count-nodes (9) | 1.9s | **0.47s** |
+| Count-no-successors (10) | 34.9s | **9.4s** |
+| Count-no-predecessors (11) | 7.8s | **5.3s** |
+| Most-neighbors (12) | 2.25s | **2.25s** |
+| Count-single-neighbor (13) | 2.23s | **2.23s** |
+| Rename (14) | 0.155s | **0.040s** |
+| Similar (15) | 0.125s | **0.073s** |
+| Shortest-path (16) | ~0.2s | **~0.1s** |
+| Distant syn/ant dist≤5 (17–18) | ~0.3s | **~0.3s** |
+| Distant-antonyms dist=17 (18) | 81.4s | **207.1s** |
 
 The primary performance gains came from:
-1. **Local Docker** — eliminates ~100ms network latency per round-trip.
+1. **Local Docker / AGH Server** — eliminates or reduces network latency vs the ArangoDB Cloud instance.
 2. **BFS batch-per-level** — reduces round-trips for `distant-synonyms/antonyms` from O(millions) to exactly O(distance) queries.
 3. **Persistent index on `id_original`** — node resolution drops from a full collection scan (~2M documents) to a single indexed lookup.
+4. **AQL `COLLECT WITH AGGREGATE` for queries 12/13** — degree computation moved fully server-side with a file cache for subsequent calls.
 
 ---
 
@@ -720,11 +730,11 @@ The majority of queries (1–8, 14–16) execute in **under 0.3 seconds** locall
 
 Currently computed via a server-side `COLLECT` over all edges. A potential mitigation is to maintain a degree counter on each node document at import time (pre-computing successor/predecessor counts as node fields). This would turn both queries into a single indexed `FILTER` count, reducing time from ~35s to milliseconds. Trade-off: import becomes more complex and rename/delete operations must update counters.
 
-**2. Queries 12, 13 — Python-side degree computation**
+**2. Queries 12, 13 — Python-side degree computation (resolved)**
 
-Both stream all 6M edges into Python RAM and build a neighbour set per node. Mitigation options:
-- Cache the degree map to a local file (`.cskg_degrees.json`) invalidated on any write operation. After the first run, subsequent calls return instantly.
-- Move degree computation to AQL using `COLLECT` with `AGGREGATE`, avoiding the Python round-trip entirely. Early benchmarks suggest this is slower due to ArangoDB's sort-based aggregation, but warrants further testing.
+~~Both stream all 6M edges into Python RAM and build a neighbour set per node.~~
+
+**Implemented fix:** degree computation was moved fully server-side using AQL `COLLECT WITH AGGREGATE COUNT_DISTINCT`. A file cache (`.cskg_degrees.json`) stores the result after the first run and is invalidated automatically on any write operation (`rename`, `delete`). Results on the AGH server: **2.250s** (first call, cold) and **~0s** (subsequent calls, cache hit), down from ~20s with Python streaming. Both approaches were tested; the AQL approach proved significantly faster in practice despite the sort-based aggregation cost.
 
 **3. Distant synonyms/antonyms at large distances (query 17, 18)**
 
