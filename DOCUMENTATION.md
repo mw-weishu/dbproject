@@ -32,7 +32,7 @@
 - **Persistent indexes** — supports persistent B-tree indexes on any document field, enabling fast `FILTER` operations without full collection scans.
 - **REST API + python-arango** — well-supported Python client library for programmatic access.
 - **Docker availability** — official Docker image enables a fully local deployment with zero configuration.
-- **ArangoDB Cloud** — the same software is available as a managed cloud service (used for initial development and university server testing).
+- **ArangoDB Cloud** — the same software is available as a managed cloud service (used for initial development).
 
 ### Language: Python 3
 
@@ -42,12 +42,12 @@ The CLI utility and importer are written in Python 3 because:
 - `argparse` provides clean CLI argument parsing with subcommands.
 - The BFS logic for distant synonyms/antonyms is straightforward to express in Python while delegating bulk expansion to ArangoDB per level.
 
-### Dataset: CSKG (Common Sense Knowledge Graph)
+### Dataset: CSKG
 
 CSKG is distributed as a tab-separated file (`cskg.tsv`) in KGTK format with columns:  
 `id`, `node1`, `relation`, `node2`, `node1;label`, `node2;label`, `relation;label`, `relation;dimension`, `source`, `sentence`
 
-The dataset contains approximately **6,001,531 edges** and **2,160,968 unique nodes**.
+The dataset contains **6,001,531 edges** and **2,160,968 unique nodes**.
 
 ---
 
@@ -101,6 +101,52 @@ The dataset contains approximately **6,001,531 edges** and **2,160,968 unique no
 | `relation_label` | string | Human-readable relation label (optional) |
 | `source` | string | Source knowledge base (optional) |
 | `sentence` | string | Natural language sentence (optional) |
+
+### JSON Schema Validation
+
+ArangoDB supports optional JSON Schema validation per collection, applied at write time.
+
+**`nodes` collection schema**
+
+```json
+{
+  "level": "moderate",
+  "message": "Node document must have id_original (string) and label (string).",
+  "rule": {
+    "type": "object",
+    "properties": {
+      "id_original": { "type": "string", "minLength": 1 },
+      "label":       { "type": "string" },
+      "labels":      { "type": "string" }
+    },
+    "required": ["id_original", "label"],
+    "additionalProperties": true
+  }
+}
+```
+
+**`relation` collection schema**
+
+```json
+{
+  "level": "moderate",
+  "message": "Edge document must have relation (string), _from (string), and _to (string).",
+  "rule": {
+    "type": "object",
+    "properties": {
+      "_from":              { "type": "string", "minLength": 1 },
+      "_to":                { "type": "string", "minLength": 1 },
+      "relation":           { "type": "string", "minLength": 1 },
+      "relation_label":     { "type": "string" },
+      "relation_dimension": { "type": "string" },
+      "source":             { "type": "string" },
+      "sentence":           { "type": "string" }
+    },
+    "required": ["relation"],
+    "additionalProperties": true
+  }
+}
+```
 
 ### Indexes
 
@@ -566,7 +612,7 @@ two tears in bucket /c/en/two_tears_in_bucket
 que sera sera /c/en/que_sera_sera
 che sara sara /c/en/che_sara_sara
 everywoman /c/en/everywoman
-Query time: 101.626s
+Query time: 81.432s
 ```
 
 ### Complete timing results
@@ -586,11 +632,11 @@ All queries verified against expected output. Results match in value; shortest-p
 | 6 | count-neighbors | `/c/en/tower` | 254 | 0.094s | **0.094s** |
 | 7 | grandchildren | `/c/en/coco` | 7 nodes | 0.089s | **0.029s** |
 | 8 | grandparents | `fn:fe:deceiver` | 5 nodes | 0.087s | **0.029s** |
-| 9 | count-nodes | — | 2,160,968 | 1.922s | **0.473s** |
+| 9 | count-nodes | — | 2,160,968 | 0.239s | **0.473s** |
 | 10 | count-no-successors | — | 649,184 | 7.337s | **9.436s** |
 | 11 | count-no-predecessors | — | 1,129,781 | 7.776s | **5.331s** |
-| 12 | most-neighbors | — | `/c/en/slang` (11,038) | 2.250s | **2.250s** |
-| 13 | count-single-neighbor | — | 1,276,217 | 2.234s | **2.234s** |
+| 12 | most-neighbors | — | `/c/en/slang` (11,038) | 1.738s | **2.250s** |
+| 13 | count-single-neighbor | — | 1,276,217 | 1.537s | **2.234s** |
 | 14 | rename | `/c/en/allocator` → `asdf` | OK | 0.155s | **0.040s** |
 | 15 | similar | `/c/en/crystallised` | 8 nodes | 0.125s | **0.073s** |
 | 16 | shortest-path | spaceship → tomato | 3 hops | 0.173s | **0.109s** |
