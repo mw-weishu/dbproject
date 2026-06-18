@@ -1,5 +1,6 @@
 # Ignore the generated TSV file
 cskg.tsv
+.cskg_degrees.json
 
 # Python cache
 __pycache__/
